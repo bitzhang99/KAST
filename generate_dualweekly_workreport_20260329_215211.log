@@ -1,0 +1,12 @@
+运行时间: 2026-03-29 21:52:11
+配置文件: E:\python_source\KAST\workreport-JK.ini
+模板文件: E:\python_source\需求导入\双周报需求模板.docx
+使用表格索引: 0
+输入文件:
+ - E:\python_source\需求导入\需求台账模板（20260327）.xlsx
+输出文件: E:\python_source\需求导入\双周报需求模板_20260329.docx
+日志文件: E:\python_source\KAST\generate_dualweekly_workreport_20260329_215211.log
+模板原有表格数据行数: 1
+本次新增记录数: 4
+输出表格总行数(含表头): 6
+定位说明: Word 标准 docx 无法在打开时自动将光标跳到表格；请使用「查找」->「转到」->「书签」-> 名称「NewImportedData」跳转到首条新增行。

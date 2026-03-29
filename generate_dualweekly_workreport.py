@@ -41,7 +41,7 @@ from docx.oxml.ns import qn
 #          "固定"+Excel列名+"\n"+另一列；双引号内支持 \\n \\t \\r \\\\ \\" 等转义；在 Title_Map 之后生效并覆盖同名列。
 
 
-CONFIG_FILENAME = "workreport.ini"
+CONFIG_FILENAME = "workreport-JK.ini"
 CONFIG_SECTION = "PATHS"
 DEFAULT_ISSUE_TEXT = "暂无"
 BOOKMARK_NEW_DATA = "NewImportedData"

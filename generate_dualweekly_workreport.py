@@ -39,7 +39,9 @@ from docx.oxml.ns import qn
 # [WR-015] 可选 WORD_TABLE_INDEX 指定使用文档中第几张表（从 0 开始），默认 0。
 # [WR-016] 可选 Compose_Map（JSON）：按 Word 表头列名拼接多列与固定字符串，表达式形如
 #          "固定"+Excel列名+"\n"+另一列；双引号内支持 \\n \\t \\r \\\\ \\" 等转义；在 Title_Map 之后生效并覆盖同名列。
-
+# [WR-017]  修改日期格式为  YYYY/MM/DD，修改“需求复杂度”的格式为“（实施复杂度：标准）”，选用的列也采用“实施复杂度”
+# [WR-018]  此处修改，解决了由于 word 表头有“受理时间”改为“需求审批\n时间”造成的日期格式显示没有按照yyyy/mm/dd 显示的问题，
+#       不修改将按照excel表格原始格式显示
 
 CONFIG_FILENAME = "workreport-JK.ini"
 CONFIG_SECTION = "PATHS"
@@ -335,7 +337,8 @@ def format_accept_date(value: object) -> str:
     ts = pd.to_datetime(value, errors="coerce")
     if pd.isna(ts):
         return normalize(value)
-    return ts.strftime("%Y-%m-%d")
+    # [WR-017] 修改了日期格式 
+    return ts.strftime("%Y/%m/%d")
 
 
 def emit_log(lines: list[str], log_path: Path) -> None:
@@ -506,8 +509,9 @@ def main() -> None:
     if row_limit is not None:
         # [WR-010]
         all_in = all_in.head(row_limit).reset_index(drop=True)
-
-    accept_word_col = "受理时间" if "受理时间" in word_col_index else None
+    # [WR-018]  此处修改，解决了由于 word 表头有“受理时间”改为“需求审批\n时间”造成的日期格式显示没有按照yyyy/mm/dd 显示的问题，
+    # 不修改将按照excel表格原始格式显示
+    accept_word_col = "需求审批\n时间" if "需求审批\n时间" in word_col_index else None
     if accept_word_col is None:
         for _src, tgts in title_map.items():
             for t in tgts:
@@ -552,11 +556,12 @@ def main() -> None:
             # 在前面添加【新增】
             modified_text = f"【新增】{original_text}"
             # 添加需求复杂点
-            complexity_col = "需求复杂度"
+            complexity_col = "实施复杂度"
             if complexity_col in all_in.columns:
                 complexity_val = normalize(row[complexity_col])
                 if complexity_val:
-                    modified_text = f"{modified_text}\n需求复杂度：{complexity_val}"
+                    # [WR-017] 修改了需求复杂度的显示格式
+                    modified_text = f"{modified_text}\n（实施复杂度：{complexity_val}）"
             rec[requirement_col] = modified_text
 
         for word_col, expr in compose_map.items():
@@ -582,7 +587,8 @@ def main() -> None:
         for t in sorted(missing_compose_targets):
             print(f" - {t}")
 
-    sort_col = accept_word_col or "受理时间"
+    # 排序字段
+    sort_col = accept_word_col or "需求审批\n时间"
 
     def sort_key(rec: dict[str, str]) -> tuple:
         d = parse_sort_date(rec.get(sort_col, ""))

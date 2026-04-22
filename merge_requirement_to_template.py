@@ -26,6 +26,7 @@ import os
 # V12: 输出 Excel 打开时默认定位到“原模板数据倒数5行”位置，便于续看历史数据
 # V13: 读取 ini 使用 utf-8-sig，兼容 Windows 记事本保存的带 BOM 的 UTF-8
 # 解决了pyinstaller 打包以后找不到配置文件的问题
+# V14：20260408-给“工单状态”默认赋值“进行中”，“事项来源”默认赋值“ITM”
 CONFIG_PATH = Path(__file__).with_name("merge_requirement_to_template.ini")
 CONFIG_SECTION = "PATHS"
 
@@ -352,12 +353,17 @@ def main() -> None:
             for target_col in target_cols:
                 out[target_col] = src[src_col] if src_col in src.columns else pd.NA
 
+        # V14:20260408 对一些固定的列做默认值填写
+        out['事项来源'] = 'ITM'
+        out['当前状态'] = '进行中'        
+        
         # Fill non-mapped template columns with NA so append order stays aligned
         for col in template_headers:
             if col not in out.columns:
                 out[col] = pd.NA
         out = out[template_headers]
 
+        
         # Keep only columns that are truly in template
         out = out[[c for c in out.columns if c in template_header_set]]
         merged_parts.append(out)

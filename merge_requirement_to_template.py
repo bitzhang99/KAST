@@ -4,11 +4,13 @@ import configparser
 import difflib
 import json
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
-import os
+from openpyxl.formula.translate import Translator
+from openpyxl.utils import get_column_letter, column_index_from_string
 
 # 修订记录（按时间顺序）
 # V1: 基础版，支持固定路径读取模板与输入文件并写出结果
@@ -27,10 +29,16 @@ import os
 # V13: 读取 ini 使用 utf-8-sig，兼容 Windows 记事本保存的带 BOM 的 UTF-8
 # 解决了pyinstaller 打包以后找不到配置文件的问题
 # V14：20260408-给“工单状态”默认赋值“进行中”，“事项来源”默认赋值“ITM”
+# V15：20260510-以导入“要求编号”映射后的键为唯一键；与模板“业务要求编号”或“工单编号/ITM编号”匹配则整行按导入字段更新；
+#      多文件导入先去重；AC/AD/AE 列按模板首行公式模式向下翻译写入；转换失败日志记录到具体记录键与字段；
+#      修复重复列名/混合类型排序等导致的 could not convert string to float 类错误
 CONFIG_PATH = Path(__file__).with_name("merge_requirement_to_template.ini")
 CONFIG_SECTION = "PATHS"
 
 TEMPLATE_SHEET = "模板页"
+# [V15] 与模板中行公式同步：按列将首行数据区的公式模式复制到所有数据行（AC/AD/AE）
+FORMULA_COLUMN_LETTERS = ("AC", "AD", "AE")
+FORMULA_COL_INDEX: tuple[int, ...] = tuple(column_index_from_string(c) for c in FORMULA_COLUMN_LETTERS)
 
 
 def normalize(s: object) -> str:
@@ -291,6 +299,117 @@ def parse_datetime_cell(value: object) -> object:
     return ts.to_pydatetime()
 
 
+# [V15] 合并重复表头（归一化后同名）时保留首列，避免 select 出 DataFrame 导致 to_datetime/sort 异常
+def consolidate_duplicate_header_columns(df: pd.DataFrame, log_lines: list[str], label: str) -> pd.DataFrame:
+    norm_cols = [normalize(str(c)) for c in df.columns]
+    seen: set[str] = set()
+    drop_list: list[int | str] = []
+    for i, c in enumerate(df.columns):
+        key = norm_cols[i] or f"_col{i}"
+        if key in seen:
+            log_lines.append(f"[列名警告][{label}] 归一化后重复的列已忽略: 原始列名={c!r} (键={key})")
+            drop_list.append(c)
+        else:
+            seen.add(key)
+    out = df.drop(columns=drop_list, errors="ignore").copy()
+    out.columns = [normalize(str(c)) for c in out.columns]
+    return out
+
+
+# [V15] 模板行匹配键：优先“业务要求编号”，否则“工单编号/ITM编号”（与导入侧“要求编号”映射键对齐）
+def template_match_key_series(df: pd.DataFrame) -> pd.Series:
+    has_biz = "业务要求编号" in df.columns
+    has_ticket = "工单编号/ITM编号" in df.columns
+    if not has_biz and not has_ticket:
+        return pd.Series([""] * len(df), index=df.index)
+    k_biz = df["业务要求编号"].map(normalize) if has_biz else pd.Series("", index=df.index)
+    k_ticket = df["工单编号/ITM编号"].map(normalize) if has_ticket else pd.Series("", index=df.index)
+    merged = k_biz.where((k_biz != "") & (~k_biz.isna()), k_ticket)
+    merged = merged.fillna("").map(lambda x: normalize(x))
+    return merged
+
+
+# [V15] 在删除数据行前抓取 AC/AD/AE 上首个含公式的行，作为向下复制的锚点
+def capture_formula_templates_for_columns(
+    ws, col_indexes: tuple[int, ...], scan_rows: int = 30
+) -> dict[int, tuple[str, str]]:
+    specs: dict[int, tuple[str, str]] = {}
+    max_scan = min(ws.max_row, scan_rows)
+    for r in range(2, max_scan + 1):
+        row_has_formula = False
+        for c in col_indexes:
+            cell = ws.cell(row=r, column=c)
+            v = cell.value
+            if isinstance(v, str) and v.startswith("="):
+                col_letter = get_column_letter(c)
+                specs[c] = (v, f"{col_letter}{r}")
+                row_has_formula = True
+        if row_has_formula:
+            break
+    return specs
+
+
+# [V15] 将锚点公式按目标行翻译写入（列模式复制）
+def apply_formula_templates_to_rows(
+    ws, specs: dict[int, tuple[str, str]], row_from: int, row_to: int, log_lines: list[str]
+) -> None:
+    if row_to < row_from or not specs:
+        return
+    for r in range(row_from, row_to + 1):
+        for c, (formula, origin) in specs.items():
+            col_letter = get_column_letter(c)
+            dest = f"{col_letter}{r}"
+            try:
+                ws.cell(row=r, column=c).value = Translator(formula, origin=origin).translate_formula(dest)
+            except Exception as exc:
+                log_lines.append(f"[公式写入警告] 行={r} 列={col_letter} 原因={exc}")
+
+
+# [V15] 导入行覆盖模板行：导入非空则更新，否则保留模板原值
+def merge_template_row_with_import(base: pd.Series, imp: pd.Series, headers: list[str]) -> pd.Series:
+    out = base.reindex(headers).copy()
+    for col in headers:
+        if col not in imp.index:
+            continue
+        v = imp[col]
+        if pd.isna(v):
+            continue
+        out[col] = v
+    return out
+
+
+# [V15] 日期列逐格转换，失败时记录「记录键 + 字段 + 原始值」
+def parse_datetime_series_logged(
+    series: pd.Series, row_keys: pd.Series, col_name: str, log_lines: list[str]
+) -> pd.Series:
+    out: list[object] = []
+    for i in range(len(series)):
+        raw = series.iloc[i]
+        rk = normalize(row_keys.iloc[i]) if i < len(row_keys) else ""
+        try:
+            out.append(parse_datetime_cell(raw))
+        except Exception as exc:
+            # [V15] 捕获含 could not convert string to float 在内的各类转换异常并落日志
+            log_lines.append(
+                f"[字段转换失败] 记录键(工单编号/ITM编号)={rk or '(空)'} 字段={col_name} "
+                f"原始值={raw!r} 错误类型={type(exc).__name__} 错误信息={exc}"
+            )
+            out.append(pd.NA)
+    return pd.Series(out, index=series.index)
+
+
+# [V15] 对「创建时间」排序列安全 to_datetime，避免重复列返回 DataFrame 或混合类型触发 float 转换异常
+def safe_series_to_datetime_for_sort(s: pd.Series, log_lines: list[str], label: str) -> pd.Series:
+    if isinstance(s, pd.DataFrame):
+        log_lines.append(f"[排序警告][{label}] 「创建时间」对应多列，已仅使用第一列参与排序")
+        s = s.iloc[:, 0]
+    try:
+        return pd.to_datetime(s, errors="coerce")
+    except (ValueError, TypeError) as exc:
+        log_lines.append(f"[排序警告][{label}] 「创建时间」to_datetime 失败({exc})，已回退为不作为时间排序")
+        return pd.Series([pd.NaT] * len(s), index=s.index)
+
+
 def collect_duplicate_ids(df: pd.DataFrame, unique_key: str) -> list[str]:
     if unique_key not in df.columns:
         return []
@@ -327,164 +446,193 @@ def set_initial_view_to_template_tail(ws, original_template_rows: int) -> None:
 
 def main() -> None:
     # [V6->V8] 从固定配置文件读取路径、多输入文件、标题映射与回复人映射
-    template_path, input_paths, missing_inputs, title_map, responder_mapping = load_config_from_ini(CONFIG_PATH)
-    if missing_inputs:
-        print("警告: 以下输入文件不存在，已自动跳过：")
-        for p in missing_inputs:
-            print(f" - {p}")
-
-    # [V3] 读取模板页表头与已有数据，后续用于列对齐与增量合并
-    template_df = pd.read_excel(template_path, sheet_name=TEMPLATE_SHEET)
-    # [R12-02] 保留原模板数据量，用于设置输出文件打开时的初始定位行
-    original_template_rows = len(template_df)
-    template_headers = [normalize(c) for c in template_df.columns]
-    template_header_set = set(template_headers)
-    template_df.columns = template_headers
-
-    merged_parts: list[pd.DataFrame] = []
-    for p in input_paths:
-        # [V6] 每个输入文件独立读取并统一映射后再汇总
-        src = read_input_with_fallback(p)
-        src.columns = [normalize(c) for c in src.columns]
-
-        out = pd.DataFrame(index=src.index)
-        # [V8] Title_Map 支持一对多映射（如 接收日期 -> [创建时间, 回复时间/ITM回函时间]）
-        for src_col, target_cols in title_map.items():
-            for target_col in target_cols:
-                out[target_col] = src[src_col] if src_col in src.columns else pd.NA
-
-        # V14:20260408 对一些固定的列做默认值填写
-        out['事项来源'] = 'ITM'
-        out['当前状态'] = '进行中'        
-        
-        # Fill non-mapped template columns with NA so append order stays aligned
-        for col in template_headers:
-            if col not in out.columns:
-                out[col] = pd.NA
-        out = out[template_headers]
-
-        
-        # Keep only columns that are truly in template
-        out = out[[c for c in out.columns if c in template_header_set]]
-        merged_parts.append(out)
-
-    if not merged_parts:
-        raise ValueError("没有可合并的输入数据，请检查 INPUT_PATHS 配置。")
-    all_new_rows = pd.concat(merged_parts, ignore_index=True)
-
-    unique_key = "工单编号/ITM编号"
-    if unique_key not in template_headers:
-        raise ValueError(f"模板页缺少唯一索引列: {unique_key}")
-
-    # [R11-01] 先标准化唯一键，后续按“模板原顺序 + 新增排序追加”构建结果，避免混编
-    template_base = template_df[template_headers].copy()
-    template_base[unique_key] = template_base[unique_key].map(normalize)
-    template_base = template_base[template_base[unique_key] != ""].reset_index(drop=True)
-
-    new_rows = all_new_rows.copy()
-    new_rows[unique_key] = new_rows[unique_key].map(normalize)
-    new_rows = new_rows[new_rows[unique_key] != ""].reset_index(drop=True)
-
-    # [R11-02] 统计去重前重复键（模板内、新数据内、模板与新数据交叉重复都纳入日志）
-    duplicate_source = pd.concat([template_base, new_rows], ignore_index=True)
-    duplicate_ids = collect_duplicate_ids(duplicate_source, unique_key)
-
-    # [R11-03] 模板内若自身有重复，按最后一条保留，维持其在模板中的相对顺序
-    template_base = template_base.drop_duplicates(subset=[unique_key], keep="last").reset_index(drop=True)
-
-    # [R11-04] 新数据内先去重（同一工单保留最后一条），再按创建时间升序准备追加
-    new_rows = new_rows.drop_duplicates(subset=[unique_key], keep="last").reset_index(drop=True)
-    append_rows = new_rows[~new_rows[unique_key].isin(template_base[unique_key])].copy()
-    if "创建时间" in append_rows.columns:
-        append_rows["_sort_created_time"] = pd.to_datetime(append_rows["创建时间"], errors="coerce")
-        append_rows = append_rows.sort_values(
-            by=["_sort_created_time", unique_key], ascending=[True, True], na_position="last"
-        ).drop(columns=["_sort_created_time"])
-    append_rows = append_rows.reset_index(drop=True)
-
-    # [R11-05] 最终结果为“模板原数据 + 新增排序数据”，保证新增记录统一追加在末尾
-    combined = pd.concat([template_base, append_rows], ignore_index=True)
-
-    customer_name_col = "客户名称"
-    customer_type_col = "客户类型"
-    if customer_name_col in combined.columns:
-        if customer_type_col in combined.columns:
-            # [V4] 仅当可识别客户类型时覆盖，避免误清空原模板已有值
-            inferred = combined[customer_name_col].map(infer_customer_type)
-            existing = combined[customer_type_col]
-            combined[customer_type_col] = inferred.where(~inferred.isna(), existing)
-        combined[customer_name_col] = combined[customer_name_col].map(clean_customer_name)
-
-    creator_org_col = "创建人机构"
-    responder_col = "回复人"
-    if creator_org_col in combined.columns and responder_col in combined.columns:
-        combined[responder_col] = combined[creator_org_col].map(
-            lambda x: infer_responder(x, responder_mapping)
-        )
-    # 如下代码设置日期格式字段为日期  步骤2
-    date_cols = ["创建时间", "回复时间/ITM回函时间"]
-    for col in date_cols:
-        if col in combined.columns:
-            combined[col] = combined[col].map(parse_datetime_cell)
-
-    # [V1/V3] 复制模板结构并回写去重后的结果到模板页
-    output_path = build_output_path(template_path)
-    wb = load_workbook(template_path)
-    ws = wb[TEMPLATE_SHEET]
-
-    # Clear existing data rows but keep header row and formatting as much as possible.
-    if ws.max_row > 1:
-        ws.delete_rows(2, ws.max_row - 1)
-
-    start_row = 2
-    for i, row in combined.iterrows():
-        for j, col in enumerate(template_headers, start=1):
-            ws.cell(row=start_row + i, column=j, value=None if pd.isna(row[col]) else row[col])
-
-    # 如下代码设置日期格式字段为日期  步骤3
-    date_number_format = "yyyy-mm-dd hh:mm:ss"
-    for col in date_cols:
-        if col in template_headers:
-            col_idx = template_headers.index(col) + 1
-            for row_idx in range(2, ws.max_row + 1):
-                cell = ws.cell(row=row_idx, column=col_idx)
-                if cell.value is not None:
-                    cell.number_format = date_number_format
-            # Ensure date-time text is fully visible: "YYYY-MM-DD HH:MM:SS"
-            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 21
-
-    # [R12-03] 新增初始视图定位：打开文件时默认跳到原模板倒数5行（而非首行）
-    set_initial_view_to_template_tail(ws, original_template_rows)
-
-    wb.save(output_path)
-
-    # [V9->V10] 输出运行日志：写入 .log 文件并同步打印到标准输出
+    # [V15] 全程累积 log_lines，异常时亦可写出已收集的诊断信息
     log_path = build_log_path(Path(__file__))
-    log_lines: list[str] = [
-        f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"模板文件: {template_path}",
-        "输入文件:",
-    ]
-    log_lines.extend([f" - {p}" for p in input_paths])
-    if missing_inputs:
-        log_lines.append("缺失输入文件(已跳过):")
-        log_lines.extend([f" - {p}" for p in missing_inputs])
-    log_lines.extend(
-        [
+    log_lines: list[str] = []
+    try:
+        template_path, input_paths, missing_inputs, title_map, responder_mapping = load_config_from_ini(CONFIG_PATH)
+        if missing_inputs:
+            print("警告: 以下输入文件不存在，已自动跳过：")
+            for p in missing_inputs:
+                print(f" - {p}")
+
+        # [V3] 读取模板；[V15] 合并重复表头，避免「创建时间」等列变成 DataFrame 触发 float 转换异常
+        template_df = pd.read_excel(template_path, sheet_name=TEMPLATE_SHEET)
+        original_template_rows = len(template_df)
+        template_df = consolidate_duplicate_header_columns(template_df, log_lines, "模板")
+        template_headers = list(template_df.columns)
+        template_header_set = set(template_headers)
+
+        merged_parts: list[pd.DataFrame] = []
+        for p in input_paths:
+            src = read_input_with_fallback(p)
+            src = consolidate_duplicate_header_columns(src, log_lines, f"输入:{p.name}")
+
+            out = pd.DataFrame(index=src.index)
+            for src_col, target_cols in title_map.items():
+                for target_col in target_cols:
+                    out[target_col] = src[src_col] if src_col in src.columns else pd.NA
+
+            # V14:20260408 对一些固定的列做默认值填写
+            out["事项来源"] = "ITM"
+            out["当前状态"] = "进行中"
+
+            for col in template_headers:
+                if col not in out.columns:
+                    out[col] = pd.NA
+            out = out[template_headers]
+            out = out[[c for c in out.columns if c in template_header_set]]
+            merged_parts.append(out)
+
+        if not merged_parts:
+            raise ValueError("没有可合并的输入数据，请检查 INPUT_PATHS 配置。")
+        all_new_rows = pd.concat(merged_parts, ignore_index=True)
+        import_raw_row_count = len(all_new_rows)
+
+        # [V15] 唯一键：导入侧「要求编号」经 Title_Map 映射后的「工单编号/ITM编号」；与模板「业务要求编号」或「工单编号/ITM编号」匹配则更新该行
+        unique_key = "工单编号/ITM编号"
+        if unique_key not in template_headers:
+            raise ValueError(f"模板页缺少唯一索引列: {unique_key}")
+
+        new_rows = all_new_rows.copy()
+        new_rows["_ik"] = new_rows[unique_key].map(normalize)
+        new_rows = new_rows[new_rows["_ik"] != ""].reset_index(drop=True)
+        import_nonempty_key_count = len(new_rows)
+        new_rows = new_rows.drop_duplicates(subset=["_ik"], keep="last").reset_index(drop=True)
+        new_rows = new_rows.drop(columns=["_ik"])
+        import_dedup_dropped = import_nonempty_key_count - len(new_rows)
+
+        imp_dict: dict[str, pd.Series] = {}
+        for _, row in new_rows.iterrows():
+            imp_dict[normalize(row[unique_key])] = row
+
+        template_work = template_df.copy()
+        template_work["_mk"] = template_match_key_series(template_work)
+        template_work = template_work[template_work["_mk"] != ""].reset_index(drop=True)
+        template_work = template_work.drop_duplicates(subset=["_mk"], keep="last").reset_index(drop=True)
+        template_keys_set = set(template_work["_mk"].map(normalize))
+
+        dup_source = pd.DataFrame(
+            {unique_key: pd.concat([template_work["_mk"], new_rows[unique_key].map(normalize)], ignore_index=True)}
+        )
+        duplicate_ids = collect_duplicate_ids(dup_source, unique_key)
+
+        result_rows: list[pd.Series] = []
+        keys_updated: list[str] = []
+        for _, trow in template_work.iterrows():
+            mk = normalize(str(trow["_mk"]))
+            base = trow.drop(labels=["_mk"])
+            if mk in imp_dict:
+                # [V15] 模板与导入编号一致：用导入非空字段覆盖模板该行
+                result_rows.append(merge_template_row_with_import(base, imp_dict[mk], template_headers))
+                keys_updated.append(mk)
+            else:
+                result_rows.append(base.reindex(template_headers))
+
+        append_keys = [k for k in imp_dict if k not in template_keys_set]
+        append_df = pd.DataFrame([imp_dict[k] for k in append_keys], columns=template_headers)
+        if len(append_df) and "创建时间" in append_df.columns:
+            append_df["_st"] = safe_series_to_datetime_for_sort(append_df["创建时间"], log_lines, "追加排序")
+            append_df["_sk"] = append_df[unique_key].map(normalize).astype(str)
+            try:
+                append_df = append_df.sort_values(
+                    by=["_st", "_sk"], ascending=[True, True], na_position="last"
+                ).drop(columns=["_st", "_sk"])
+            except (ValueError, TypeError) as exc:
+                log_lines.append(f"[排序失败] {exc}，已回退为仅按「{unique_key}」字符串排序")
+                append_df = append_df.drop(columns=["_st", "_sk"], errors="ignore").sort_values(
+                    by=[unique_key], key=lambda s: s.astype(str)
+                )
+
+        combined = pd.concat(
+            [
+                pd.DataFrame(result_rows, columns=template_headers),
+                append_df.reindex(columns=template_headers),
+            ],
+            ignore_index=True,
+        )
+
+        customer_name_col = "客户名称"
+        customer_type_col = "客户类型"
+        if customer_name_col in combined.columns:
+            if customer_type_col in combined.columns:
+                inferred = combined[customer_name_col].map(infer_customer_type)
+                existing = combined[customer_type_col]
+                combined[customer_type_col] = inferred.where(~inferred.isna(), existing)
+            combined[customer_name_col] = combined[customer_name_col].map(clean_customer_name)
+
+        creator_org_col = "创建人机构"
+        responder_col = "回复人"
+        if creator_org_col in combined.columns and responder_col in combined.columns:
+            combined[responder_col] = combined[creator_org_col].map(
+                lambda x: infer_responder(x, responder_mapping)
+            )
+
+        date_cols = ["创建时间", "回复时间/ITM回函时间"]
+        row_keys = combined[unique_key].map(normalize) if unique_key in combined.columns else pd.Series([""] * len(combined))
+        for col in date_cols:
+            if col in combined.columns:
+                # [V15] 日期列逐格记录转换失败（记录键 + 字段名 + 原始值）
+                combined[col] = parse_datetime_series_logged(combined[col], row_keys, col, log_lines)
+
+        output_path = build_output_path(template_path)
+        wb = load_workbook(template_path)
+        ws = wb[TEMPLATE_SHEET]
+
+        # [V15] 在清空数据行前抓取 AC/AD/AE 公式锚点，删除行后再写回并翻译到各行
+        formula_specs = capture_formula_templates_for_columns(ws, FORMULA_COL_INDEX)
+        if ws.max_row > 1:
+            ws.delete_rows(2, ws.max_row - 1)
+
+        start_row = 2
+        formula_col_set = set(FORMULA_COL_INDEX)
+        for i, row in combined.iterrows():
+            excel_r = start_row + i
+            for j, col in enumerate(template_headers, start=1):
+                if j in formula_col_set:
+                    continue
+                val = row[col]
+                ws.cell(row=excel_r, column=j, value=None if pd.isna(val) else val)
+
+        apply_formula_templates_to_rows(ws, formula_specs, 2, ws.max_row, log_lines)
+
+        date_number_format = "yyyy-mm-dd hh:mm:ss"
+        for col in date_cols:
+            if col in template_headers:
+                col_idx = template_headers.index(col) + 1
+                for row_idx in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    if cell.value is not None:
+                        cell.number_format = date_number_format
+                ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 21
+
+        set_initial_view_to_template_tail(ws, original_template_rows)
+        wb.save(output_path)
+
+        log_lines = [
+            f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"程序版本修订: V15（要求编号/业务要求编号匹配更新、导入去重、公式列、转换日志）",
+            f"模板文件: {template_path}",
+            "输入文件:",
+            * [f" - {p}" for p in input_paths],
+            *(["缺失输入文件(已跳过):", *[f" - {p}" for p in missing_inputs]] if missing_inputs else []),
             f"输出文件: {output_path}",
             f"日志文件: {log_path}",
-            f"导入原始记录数: {len(all_new_rows)}",
-            f"新增记录数(追加到模板末尾): {len(append_rows)}",
+            f"导入原始记录数(多文件合计): {import_raw_row_count}",
+            f"导入侧去重删除行数(多文件重复「{unique_key}」): {import_dedup_dropped}",
+            f"与模板匹配并已更新的记录数: {len(keys_updated)}",
+            f"纯新增并追加到末尾的记录数: {len(append_df)}",
             f"去重后总记录数: {len(combined)}",
-            f"重复记录数(按{unique_key}): {len(duplicate_ids)}",
+            f"重复键统计用「{unique_key}」(含模板匹配键与导入键合并视角) 重复值个数: {len(duplicate_ids)}",
             f"重复{unique_key}值:",
-        ]
-    )
-    if duplicate_ids:
-        log_lines.extend([f" - {key}" for key in duplicate_ids])
-    else:
-        log_lines.append(" - 无")
-    emit_log(log_lines, log_path)
+            * ([f" - {key}" for key in duplicate_ids] if duplicate_ids else [" - 无"]),
+        ] + log_lines
+        emit_log(log_lines, log_path)
+    except Exception:
+        log_lines.append("---- 以下为异常发生前/处理过程中的诊断与堆栈 ----")
+        log_lines.append(traceback.format_exc())
+        emit_log(log_lines, log_path)
+        raise
 
 
 # 解决 pyinstaller 打包后找不到配置文件的问题

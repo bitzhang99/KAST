@@ -12,6 +12,7 @@ import difflib
 import json
 import sys
 import uuid
+import re
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,9 @@ from docx.oxml.ns import qn
 # [WR-017]  修改日期格式为  YYYY/MM/DD，修改“需求复杂度”的格式为“（实施复杂度：标准）”，选用的列也采用“实施复杂度”
 # [WR-018]  此处修改，解决了由于 word 表头有“受理时间”改为“需求审批\n时间”造成的日期格式显示没有按照yyyy/mm/dd 显示的问题，
 #       不修改将按照excel表格原始格式显示
+# [WR-019]  将日期格式统一有 2026/04/11  调整为2026/4/11 去掉多余的0  
+# [WR-020]  当需求复杂度字段为空是，不显示具体内容。
+
 
 CONFIG_FILENAME = "workreport-JK.ini"
 CONFIG_SECTION = "PATHS"
@@ -338,7 +342,8 @@ def format_accept_date(value: object) -> str:
     if pd.isna(ts):
         return normalize(value)
     # [WR-017] 修改了日期格式 
-    return ts.strftime("%Y/%m/%d")
+    # [WR-017] 修改了日期格式 去掉日期前面的0 
+    return re.sub(r'/0(\d)', r'/\1', ts.strftime("%Y/%m/%d"))
 
 
 def emit_log(lines: list[str], log_path: Path) -> None:
@@ -561,7 +566,12 @@ def main() -> None:
                 complexity_val = normalize(row[complexity_col])
                 if complexity_val:
                     # [WR-017] 修改了需求复杂度的显示格式
-                    modified_text = f"{modified_text}\n（实施复杂度：{complexity_val}）"
+                    # [WR-020] 当 complexity_val为空，仅显示实施复杂度，不显示具体数值
+                    # 在实际调试过程中，发现如果实施复杂度字段为空时，
+                    # 没有从表格中提取到相应数据，
+                    # 把模板中第一行中的样例数据中的内容（实施复杂度：标准）复制到后面的表格中
+                    complexity_display = complexity_val if complexity_val else ""
+                    modified_text = f"{modified_text}\n（实施复杂度：{complexity_display}）"
             rec[requirement_col] = modified_text
 
         for word_col, expr in compose_map.items():

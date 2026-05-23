@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter, column_index_from_string
 
 # 修订记录（按时间顺序）
@@ -32,6 +33,16 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 # V15：20260510-以导入“要求编号”映射后的键为唯一键；与模板“业务要求编号”或“工单编号/ITM编号”匹配则整行按导入字段更新；
 #      多文件导入先去重；AC/AD/AE 列按模板首行公式模式向下翻译写入；转换失败日志记录到具体记录键与字段；
 #      修复重复列名/混合类型排序等导致的 could not convert string to float 类错误
+# V16：增加了 Update_Columns 配置项，用于指定需要更新的列（初版未接入更新逻辑）
+# V17：20260523-匹配模板记录时仅更新 Update_Columns；更新前逐列比对该配置列与模板现有值，有差异才写入；
+#      按「要求编号|要求标题|字段|原值|新值||…」格式记录更新明细；解析 Update_Columns 时支持 Title_Map 别名
+# V18：20260523-Update_Columns 改为 ini 中 JSON 对象映射（配置列名→模板列名），程序内不再维护 UPDATE_COLUMN_ALIASES；
+#      匹配记录仅更新映射后的模板列；导入与模板待更新列值一致则跳过该列，不一致才写入；更新日志按约定格式输出
+# V19：20260523-明确更新规则：导入非空且与模板不一致才覆盖；导入为空（含空白字符串）不覆盖；日志字段名使用模板列名
+# V20：20260523-更新明细前输出更新记录数；【更新概要】按 |要求编号|要求名称|更新列…| 汇总；
+#      发生更新的单元格与新增行业务要求编号按 ini 配置颜色高亮；Update_Columns 映射仅由配置文件维护
+# V21：20260523-新增行同时对「工单编号/ITM编号」应用 Highlight_Color_New_Biz_No 高亮（与业务要求编号一致）
+
 CONFIG_PATH = Path(__file__).with_name("merge_requirement_to_template.ini")
 CONFIG_SECTION = "PATHS"
 
@@ -175,6 +186,90 @@ def parse_title_map(raw_value: str) -> dict[str, list[str]]:
     return normalized_map
 
 
+def parse_update_columns(
+    raw_columns: list | dict | str,
+    template_headers: list[str],
+    log_lines: list[str],
+) -> list[str]:
+    """
+    [V18] 将 ini 中 Update_Columns 解析为模板页实际列名。
+    配置格式为 JSON 对象：键为配置侧列名（仅作说明），值为模板页列名；新增字段只需改 ini。
+    兼容旧版 JSON 数组（元素直接写模板列名）。
+    """
+    if isinstance(raw_columns, str):
+        raw_columns = json.loads(raw_columns) if raw_columns.strip() else {}
+
+    header_set = set(template_headers)
+    resolved: list[str] = []
+
+    if isinstance(raw_columns, dict):
+        for config_key, template_col in raw_columns.items():
+            tpl_name = normalize(template_col)
+            if not tpl_name:
+                log_lines.append(f"[配置警告] Update_Columns 项「{config_key}」的模板列名为空，已忽略")
+                continue
+            if tpl_name not in header_set:
+                log_lines.append(
+                    f"[配置警告] Update_Columns 项「{config_key}」→「{tpl_name}」在模板页不存在，已忽略"
+                )
+                continue
+            if tpl_name not in resolved:
+                resolved.append(tpl_name)
+    elif isinstance(raw_columns, list):
+        log_lines.append("[配置提示] Update_Columns 为数组格式，建议改为 JSON 对象映射以便扩展")
+        for item in raw_columns:
+            name = normalize(item)
+            if not name:
+                continue
+            if name in header_set and name not in resolved:
+                resolved.append(name)
+            else:
+                log_lines.append(f"[配置警告] Update_Columns 中的列「{name}」无法对应模板列，已忽略")
+    else:
+        raise ValueError("Update_Columns 必须是 JSON 对象（配置列名→模板列名）或 JSON 数组")
+
+    if not resolved:
+        log_lines.append("[配置警告] Update_Columns 解析后为空，匹配记录将不会更新任何列")
+    return resolved
+
+
+def format_log_cell(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value).strip()
+
+
+def cell_values_equal(left: object, right: object) -> bool:
+    return format_log_cell(left) == format_log_cell(right)
+
+
+def import_value_nonempty(value: object) -> bool:
+    """[V19] 导入侧待写入值视为非空：排除 NA/None 及仅空白字符串。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
+        return False
+    return normalize(value) != ""
+
+
+def parse_highlight_color(raw_value: str, default_hex: str, label: str) -> str:
+    """[V20] 解析 ini 中的 Excel 填充色（6 位 RGB 十六进制，不含 #）。"""
+    text = normalize(raw_value).lstrip("#")
+    if not text:
+        return default_hex.upper()
+    if len(text) != 6:
+        raise ValueError(f"{label} 须为 6 位十六进制 RGB，例如 FFFF99，当前值: {raw_value!r}")
+    try:
+        int(text, 16)
+    except ValueError as exc:
+        raise ValueError(f"{label} 不是合法十六进制颜色: {raw_value!r}") from exc
+    return text.upper()
+
+
+def make_fill(hex_rgb: str) -> PatternFill:
+    return PatternFill(fill_type="solid", fgColor=hex_rgb)
+
+
 def parse_task_assigner_map(raw_value: str) -> dict[str, str]:
     if not raw_value.strip():
         raise ValueError("配置项 TaskAssigner_Map 不能为空")
@@ -200,7 +295,7 @@ def parse_task_assigner_map(raw_value: str) -> dict[str, str]:
 
 def load_config_from_ini(
     config_path: Path,
-) -> tuple[Path, list[Path], list[Path], dict[str, list[str]], dict[str, str]]:
+) -> tuple[Path, list[Path], list[Path], dict[str, list[str]], dict[str, str], list, str, str]:
     if not config_path.exists():
         raise FileNotFoundError(
             f"未找到配置文件: {config_path}\n"
@@ -246,7 +341,31 @@ def load_config_from_ini(
 
     title_map = parse_title_map(title_map_raw)
     task_assigner_map = parse_task_assigner_map(task_assigner_map_raw)
-    return template_path, existing_inputs, missing_inputs, title_map, task_assigner_map
+    
+    # [V18] 读取 Update_Columns（JSON 对象映射，在 main 中结合模板表头解析为实际列）
+    update_cols_raw = section.get("Update_Columns", "[]").strip()
+    update_cols = json.loads(update_cols_raw) if update_cols_raw.strip() else []
+    # [V20] Excel 高亮颜色（更新单元格 / 新增行业务要求编号）
+    color_updated = parse_highlight_color(
+        section.get("Highlight_Color_Updated", "FFFF99"),
+        "FFFF99",
+        "Highlight_Color_Updated",
+    )
+    color_new_biz = parse_highlight_color(
+        section.get("Highlight_Color_New_Biz_No", "CCE5FF"),
+        "CCE5FF",
+        "Highlight_Color_New_Biz_No",
+    )
+    return (
+        template_path,
+        existing_inputs,
+        missing_inputs,
+        title_map,
+        task_assigner_map,
+        update_cols,
+        color_updated,
+        color_new_biz,
+    )
 
 
 def read_input_with_fallback(path: Path) -> pd.DataFrame:
@@ -365,17 +484,49 @@ def apply_formula_templates_to_rows(
                 log_lines.append(f"[公式写入警告] 行={r} 列={col_letter} 原因={exc}")
 
 
-# [V15] 导入行覆盖模板行：导入非空则更新，否则保留模板原值
-def merge_template_row_with_import(base: pd.Series, imp: pd.Series, headers: list[str]) -> pd.Series:
+# [V19/V20] 匹配记录仅更新 Update_Columns：导入非空且与模板不一致才写入；导入为空不覆盖
+def merge_template_row_partial_update(
+    base: pd.Series,
+    imp: pd.Series,
+    headers: list[str],
+    update_columns: list[str],
+    match_key: str,
+    detail_log_lines: list[str],
+) -> tuple[pd.Series, bool, list[str]]:
+    """
+    [V19] 匹配记录仅更新 ini 中 Update_Columns 映射到的模板列。
+    规则：导入值非空 且 与模板现有值不一致 → 覆盖并记明细日志；导入为空或二者一致 → 不覆盖。
+    [V20] 返回本行实际更新的模板列名列表，供【更新概要】与 Excel 高亮使用。
+    """
     out = base.reindex(headers).copy()
-    for col in headers:
-        if col not in imp.index:
+    req_id = normalize(imp.get(match_key, base.get(match_key, "")))
+    req_title = format_log_cell(imp.get("工单概要", base.get("工单概要", "")))
+
+    field_segments: list[str] = []
+    cols_updated: list[str] = []
+    for col in update_columns:
+        if col not in imp.index or col not in base.index:
             continue
-        v = imp[col]
-        if pd.isna(v):
+        old_val = base[col]
+        new_val = imp[col]
+        if not import_value_nonempty(new_val):
+            # [V19] 导入为空，不覆盖模板
             continue
-        out[col] = v
-    return out
+        if cell_values_equal(old_val, new_val):
+            # [V19] 导入与模板一致，不更新
+            continue
+        # [V19] 导入非空且与模板不一致，写入导入值
+        out[col] = new_val
+        cols_updated.append(col)
+        field_segments.append(
+            f"{col}|{format_log_cell(old_val)}|{format_log_cell(new_val)}"
+        )
+
+    if cols_updated:
+        # [V19] 要求编号|要求标题|更新字段名|模板中现有的值|更新后的值||...
+        detail_log_lines.append(f"{req_id}|{req_title}|" + "||".join(field_segments) + "|")
+
+    return out, bool(cols_updated), cols_updated
 
 
 # [V15] 日期列逐格转换，失败时记录「记录键 + 字段 + 原始值」
@@ -423,7 +574,12 @@ def collect_duplicate_ids(df: pd.DataFrame, unique_key: str) -> list[str]:
 def emit_log(lines: list[str], log_path: Path) -> None:
     text = "\n".join(lines) + "\n"
     # [V10] 日志同时写入文件与标准输出，便于即时查看运行结果
-    print(text, end="")
+    # [V17] Windows 控制台默认 GBK，对无法编码字符做替换避免打印失败
+    try:
+        print(text, end="")
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(enc, errors="replace").decode(enc), end="")
     with log_path.open("w", encoding="utf-8") as f:
         f.write(text)
 
@@ -450,7 +606,17 @@ def main() -> None:
     log_path = build_log_path(Path(__file__))
     log_lines: list[str] = []
     try:
-        template_path, input_paths, missing_inputs, title_map, responder_mapping = load_config_from_ini(CONFIG_PATH)
+        # [V17/V20] 从 ini 读取路径、映射、Update_Columns 与高亮颜色
+        (
+            template_path,
+            input_paths,
+            missing_inputs,
+            title_map,
+            responder_mapping,
+            update_cols_raw,
+            highlight_updated_hex,
+            highlight_new_biz_hex,
+        ) = load_config_from_ini(CONFIG_PATH)
         if missing_inputs:
             print("警告: 以下输入文件不存在，已自动跳过：")
             for p in missing_inputs:
@@ -463,6 +629,11 @@ def main() -> None:
         template_headers = list(template_df.columns)
         template_header_set = set(template_headers)
 
+        # [V18] 从 ini 的 Update_Columns 映射解析待更新模板列名
+        update_columns = parse_update_columns(update_cols_raw, template_headers, log_lines)
+        unique_key = "工单编号/ITM编号"
+        if unique_key not in template_headers:
+            raise ValueError(f"模板页缺少唯一索引列: {unique_key}")
         merged_parts: list[pd.DataFrame] = []
         for p in input_paths:
             src = read_input_with_fallback(p)
@@ -488,12 +659,9 @@ def main() -> None:
             raise ValueError("没有可合并的输入数据，请检查 INPUT_PATHS 配置。")
         all_new_rows = pd.concat(merged_parts, ignore_index=True)
         import_raw_row_count = len(all_new_rows)
-
-        # [V15] 唯一键：导入侧「要求编号」经 Title_Map 映射后的「工单编号/ITM编号」；与模板「业务要求编号」或「工单编号/ITM编号」匹配则更新该行
-        unique_key = "工单编号/ITM编号"
-        if unique_key not in template_headers:
-            raise ValueError(f"模板页缺少唯一索引列: {unique_key}")
-
+        
+        
+        # [V15/V17] 唯一键：导入「要求编号」→「工单编号/ITM编号」；与模板匹配时按 V17 规则局部更新
         new_rows = all_new_rows.copy()
         new_rows["_ik"] = new_rows[unique_key].map(normalize)
         new_rows = new_rows[new_rows["_ik"] != ""].reset_index(drop=True)
@@ -519,13 +687,35 @@ def main() -> None:
 
         result_rows: list[pd.Series] = []
         keys_updated: list[str] = []
-        for _, trow in template_work.iterrows():
+        keys_matched_no_change: list[str] = []
+        # [V20] 记录每行实际更新的列，用于 Excel 高亮与【更新概要】
+        row_updated_cols: dict[int, list[str]] = {}
+        update_summary_entries: list[tuple[str, str, list[str]]] = []
+        update_detail_lines: list[str] = []
+        template_row_count = len(template_work)
+        for row_idx, (_, trow) in enumerate(template_work.iterrows()):
             mk = normalize(str(trow["_mk"]))
             base = trow.drop(labels=["_mk"])
             if mk in imp_dict:
-                # [V15] 模板与导入编号一致：用导入非空字段覆盖模板该行
-                result_rows.append(merge_template_row_with_import(base, imp_dict[mk], template_headers))
-                keys_updated.append(mk)
+                # [V19] 匹配成功：仅更新 Update_Columns（导入非空且与模板不一致的列才写入）
+                merged_row, did_update, cols_updated = merge_template_row_partial_update(
+                    base,
+                    imp_dict[mk],
+                    template_headers,
+                    update_columns,
+                    unique_key,
+                    update_detail_lines,
+                )
+                result_rows.append(merged_row)
+                if did_update:
+                    keys_updated.append(mk)
+                    row_updated_cols[row_idx] = cols_updated
+                    req_title = format_log_cell(
+                        imp_dict[mk].get("工单概要", merged_row.get("工单概要", ""))
+                    )
+                    update_summary_entries.append((mk, req_title, cols_updated))
+                else:
+                    keys_matched_no_change.append(mk)
             else:
                 result_rows.append(base.reindex(template_headers))
 
@@ -586,13 +776,32 @@ def main() -> None:
 
         start_row = 2
         formula_col_set = set(FORMULA_COL_INDEX)
+        fill_updated = make_fill(highlight_updated_hex)
+        fill_new_biz = make_fill(highlight_new_biz_hex)
+        biz_no_col = "业务要求编号"
+        biz_no_col_idx = template_headers.index(biz_no_col) + 1 if biz_no_col in template_headers else None
+        # [V21] 新增行标识列：工单编号/ITM编号（导入要求编号）与业务要求编号均使用新增行高亮色
+        ticket_col_idx = template_headers.index(unique_key) + 1 if unique_key in template_headers else None
+        append_start_idx = template_row_count
+
         for i, row in combined.iterrows():
             excel_r = start_row + i
+            is_new_row = i >= append_start_idx
+            updated_cols_this_row = row_updated_cols.get(i, [])
             for j, col in enumerate(template_headers, start=1):
                 if j in formula_col_set:
                     continue
                 val = row[col]
-                ws.cell(row=excel_r, column=j, value=None if pd.isna(val) else val)
+                cell = ws.cell(row=excel_r, column=j, value=None if pd.isna(val) else val)
+                # [V20] 仅对发生更新的字段单元格着色
+                if col in updated_cols_this_row:
+                    cell.fill = fill_updated
+            # [V20/V21] 新增行：业务要求编号、工单编号/ITM编号 使用新增行高亮色
+            if is_new_row:
+                if biz_no_col_idx is not None:
+                    ws.cell(row=excel_r, column=biz_no_col_idx).fill = fill_new_biz
+                if ticket_col_idx is not None:
+                    ws.cell(row=excel_r, column=ticket_col_idx).fill = fill_new_biz
 
         apply_formula_templates_to_rows(ws, formula_specs, 2, ws.max_row, log_lines)
 
@@ -609,24 +818,41 @@ def main() -> None:
         set_initial_view_to_template_tail(ws, original_template_rows)
         wb.save(output_path)
 
+        # [V20] 【更新概要】：|要求编号|要求名称|更新列名1|更新列名2|...
+        summary_lines: list[str] = []
+        for req_id, req_title, cols in update_summary_entries:
+            summary_lines.append("|" + "|".join([req_id, req_title, *cols]) + "|")
+
         log_lines = [
             f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"程序版本修订: V15（要求编号/业务要求编号匹配更新、导入去重、公式列、转换日志）",
+            f"程序版本修订: V21（Update_Columns 仅 ini 映射；更新概要与高亮；新增行工单编号/ITM编号高亮）",
             f"模板文件: {template_path}",
             "输入文件:",
-            * [f" - {p}" for p in input_paths],
+            *[f" - {p}" for p in input_paths],
             *(["缺失输入文件(已跳过):", *[f" - {p}" for p in missing_inputs]] if missing_inputs else []),
             f"输出文件: {output_path}",
             f"日志文件: {log_path}",
+            f"Update_Columns(解析后): {', '.join(update_columns) if update_columns else '(无)'}",
+            f"Highlight_Color_Updated: #{highlight_updated_hex}",
+            f"Highlight_Color_New_Biz_No: #{highlight_new_biz_hex}",
             f"导入原始记录数(多文件合计): {import_raw_row_count}",
             f"导入侧去重删除行数(多文件重复「{unique_key}」): {import_dedup_dropped}",
-            f"与模板匹配并已更新的记录数: {len(keys_updated)}",
+            f"与模板键匹配的记录数: {len(keys_updated) + len(keys_matched_no_change)}",
+            f"匹配但 Update_Columns 与模板无差异未更新的记录数: {len(keys_matched_no_change)}",
             f"纯新增并追加到末尾的记录数: {len(append_df)}",
             f"去重后总记录数: {len(combined)}",
             f"重复键统计用「{unique_key}」(含模板匹配键与导入键合并视角) 重复值个数: {len(duplicate_ids)}",
             f"重复{unique_key}值:",
-            * ([f" - {key}" for key in duplicate_ids] if duplicate_ids else [" - 无"]),
-        ] + log_lines
+            *([f" - {key}" for key in duplicate_ids] if duplicate_ids else [" - 无"]),
+            # [V20] 更新明细前先输出更新记录数
+            f"发生列更新的记录数: {len(keys_updated)}",
+            "【更新概要】",
+            *(summary_lines if summary_lines else [" (无更新记录)"]),
+            "--- 列更新明细(要求编号|要求标题|更新字段名|模板中现有的值|更新后的值||...) ---",
+            *update_detail_lines,
+            "--- 运行过程其它日志 ---",
+            *log_lines,
+        ]
         emit_log(log_lines, log_path)
     except Exception:
         log_lines.append("---- 以下为异常发生前/处理过程中的诊断与堆栈 ----")
